@@ -1,6 +1,6 @@
+<?xml version="1.0"?>
 <ivysettings>
-
- <!--
+  <!--
    Licensed to the Apache Software Foundation (ASF) under one or more
    contributor license agreements.  See the NOTICE file distributed with
    this work for additional information regarding copyright ownership.
@@ -16,8 +16,7 @@
    See the License for the specific language governing permissions and
    limitations under the License.
 -->
-
- <!--
+  <!--
   see http://www.jayasoft.org/ivy/doc/configuration
   -->
   <!-- you can override this property to use mirrors
@@ -31,8 +30,7 @@
   -->
   <property name="repo.maven.org" value="${mvnrepo}" override="true"/>
   <property name="repo.jboss.org" value="http://repository.jboss.com/nexus/content/groups/public/" override="false"/>
-
-  <property name="maven2.pattern"  value="[organisation]/[module]/[revision]/[module]-[revision](-[classifier])"/> 
+  <property name="maven2.pattern" value="[organisation]/[module]/[revision]/[module]-[revision](-[classifier])"/>
   <property name="maven2.pattern.ext" value="${maven2.pattern}.[ext]"/>
   <!-- pull in the local repository -->
   <include url="${ivy.default.conf.dir}/ivyconf-local.xml"/>
@@ -40,10 +38,12 @@
   <resolvers>
     <ibiblio name="maven2" root="${repo.maven.org}" pattern="${maven2.pattern.ext}" m2compatible="true"/>
     <ibiblio name="jboss-maven2" root="${repo.jboss.org}" pattern="${maven2.pattern.ext}" m2compatible="true"/>
+    <ibiblio name="cloudera" root="https://repository.cloudera.com/content/repositories/releases/" pattern="${maven2.pattern.ext}" m2compatible="true"/>
     <chain name="default" dual="true">
       <resolver ref="local"/>
       <resolver ref="maven2"/>
       <resolver ref="jboss-maven2"/>
+      <resolver ref="cloudera" />
     </chain>
     <chain name="internal">
       <resolver ref="local"/>
