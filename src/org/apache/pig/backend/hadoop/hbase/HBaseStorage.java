@@ -74,6 +74,7 @@ import org.apache.pig.ResourceSchema.ResourceFieldSchema;
 import org.apache.pig.StoreFuncInterface;
 import org.apache.pig.backend.hadoop.executionengine.mapReduceLayer.PigSplit;
 import org.apache.pig.backend.hadoop.hbase.HBaseTableInputFormat.HBaseTableIFBuilder;
+import org.apache.pig.backend.hadoop.datastorage.ConfigurationUtil;
 import org.apache.pig.builtin.Utf8StorageConverter;
 import org.apache.pig.data.DataBag;
 import org.apache.pig.data.DataByteArray;
@@ -433,14 +434,7 @@ public class HBaseStorage extends LoadFunc implements StoreFuncInterface, LoadPu
     @Override
     public void setLocation(String location, Job job) throws IOException {
         job.getConfiguration().setBoolean("pig.noSplitCombination", true);
-        m_conf = job.getConfiguration();
-        HBaseConfiguration.addHbaseResources(m_conf);
-
-        // Make sure the HBase, ZooKeeper, and Guava jars get shipped.
-        TableMapReduceUtil.addDependencyJars(job.getConfiguration(), 
-            org.apache.hadoop.hbase.client.HTable.class,
-            com.google.common.collect.Lists.class,
-            org.apache.zookeeper.ZooKeeper.class);
+        m_conf = initialiseHBaseClassLoaderResources(job);
 
         String tablename = location;
         if (location.startsWith("hbase://")){
@@ -474,6 +468,19 @@ public class HBaseStorage extends LoadFunc implements StoreFuncInterface, LoadPu
             p.setProperty(contextSignature + "_projectedFields", ObjectSerializer.serialize(requiredFieldList));
         }
         m_conf.set(TableInputFormat.SCAN, convertScanToString(scan));
+    }
+
+    private Configuration initialiseHBaseClassLoaderResources(Job job) throws IOException {
+        Configuration hbaseConfig = HBaseConfiguration.create();
+        ConfigurationUtil.mergeConf(hbaseConfig, job.getConfiguration());
+
+        // Make sure the HBase, ZooKeeper, and Guava jars get shipped.
+        TableMapReduceUtil.addDependencyJars(job.getConfiguration(),
+            org.apache.hadoop.hbase.client.HTable.class,
+            com.google.common.collect.Lists.class,
+            org.apache.zookeeper.ZooKeeper.class);
+
+        return hbaseConfig;
     }
 
     @Override
@@ -635,8 +642,8 @@ public class HBaseStorage extends LoadFunc implements StoreFuncInterface, LoadPu
         Properties props = UDFContext.getUDFContext().getUDFProperties(getClass(), new String[]{contextSignature});
         if (!props.containsKey(contextSignature + "_schema")) {
             props.setProperty(contextSignature + "_schema",  ObjectSerializer.serialize(schema_));
-    }
-        m_conf = HBaseConfiguration.addHbaseResources(job.getConfiguration());
+        }
+        m_conf = initialiseHBaseClassLoaderResources(job);
     }
 
     @Override
