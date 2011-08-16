@@ -21,12 +21,7 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.DataInput;
 import java.io.DataOutput;
-import java.util.Arrays;
-import java.util.List;
-import java.util.Map;
-import java.util.NavigableMap;
-import java.util.HashMap;
-import java.util.Properties;
+import java.util.*;
 
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.CommandLineParser;
@@ -49,6 +44,7 @@ import org.apache.hadoop.hbase.filter.FilterList;
 import org.apache.hadoop.hbase.filter.RowFilter;
 import org.apache.hadoop.hbase.filter.FamilyFilter;
 import org.apache.hadoop.hbase.filter.ColumnPrefixFilter;
+import org.apache.hadoop.hbase.filter.PrefixFilter;
 import org.apache.hadoop.hbase.filter.Filter;
 import org.apache.hadoop.hbase.io.ImmutableBytesWritable;
 import org.apache.hadoop.hbase.mapreduce.TableInputFormat;
@@ -88,6 +84,8 @@ import org.apache.pig.impl.util.ObjectSerializer;
 import org.apache.pig.impl.util.UDFContext;
 
 import com.google.common.collect.Lists;
+
+import static org.apache.pig.backend.hadoop.datastorage.ConfigurationUtil.mergeConf;
 
 /**
  * A HBase implementation of LoadFunc and StoreFunc.
@@ -129,7 +127,8 @@ public class HBaseStorage extends LoadFunc implements StoreFuncInterface, LoadPu
     private final static String CASTER_PROPERTY = "pig.hbase.caster";
     private final static String ASTERISK = "*";
     private final static String COLON = ":";
-    
+    private static final String ROWKEY_PREFIXES_DELIMITER = ",";
+
     private List<ColumnInfo> columnInfo_ = Lists.newArrayList();
     private HTable m_table;
     private Configuration m_conf;
@@ -143,8 +142,15 @@ public class HBaseStorage extends LoadFunc implements StoreFuncInterface, LoadPu
     private final static Options validOptions_ = new Options();
     private final static CommandLineParser parser_ = new GnuParser();
     private boolean loadRowKey_;
+    private boolean loadAsTimeStampVersionTuples_;
     private final long limit_;
     private final int caching_;
+    private boolean omitNulls_;
+    private final long scanStartTimeStamp_;
+    private final long scanEndTimeStamp_;
+    private final int scanMaxVersions_;
+    private final long putTimeStamp_;
+    private final String rowKeyFilterPrefixes_;
 
     protected transient byte[] gt_;
     protected transient byte[] gte_;
@@ -156,18 +162,29 @@ public class HBaseStorage extends LoadFunc implements StoreFuncInterface, LoadPu
     private ResourceSchema schema_;
     private RequiredFieldList requiredFieldList;
     private boolean initialized = false;
+    private Iterator currentRowVersions;
+    private Result currentResult;
 
     private static void populateValidOptions() { 
         validOptions_.addOption("loadKey", false, "Load Key");
+        validOptions_.addOption("loadAsTimeStampVersionTuples", false, "Load tuples flattened on Row timestamp versions");
         validOptions_.addOption("gt", true, "Records must be greater than this value " +
                 "(binary, double-slash-escaped)");
-        validOptions_.addOption("lt", true, "Records must be less than this value (binary, double-slash-escaped)");   
+        validOptions_.addOption("lt", true, "Records must be less than this value (binary, double-slash-escaped)");
         validOptions_.addOption("gte", true, "Records must be greater than or equal to this value");
         validOptions_.addOption("lte", true, "Records must be less than or equal to this value");
         validOptions_.addOption("caching", true, "Number of rows scanners should cache");
         validOptions_.addOption("limit", true, "Per-region limit");
         validOptions_.addOption("caster", true, "Caster to use for converting values. A class name, " +
                 "HBaseBinaryConverter, or Utf8StorageConverter. For storage, casters must implement LoadStoreCaster.");
+        validOptions_.addOption("omitNulls", false, "Used to omit non-existent columns during load rather than " +
+                "presenting null values. For storage, avoid storing nulls in hbase, instead omit the column");
+        validOptions_.addOption("scanMaxVersions", true, "Maximum versions to be returned by the current scan");
+        validOptions_.addOption("scanStartTimestamp", true, "Record version timestamps must be greater than this value");
+        validOptions_.addOption("scanEndTimestamp", true, "Record version timestamps must be lesser than this value");
+        validOptions_.addOption("rowKeyPrefixes", true, "Records rowkeys must start with this prefix");
+        validOptions_.addOption("putTimestamp", true, "Specify the Put timestamp to be used for the current records stored in HBase. " +
+                "If not specified, it will default to current timestamp.");
     }
 
     /**
@@ -215,7 +232,7 @@ public class HBaseStorage extends LoadFunc implements StoreFuncInterface, LoadPu
             configuredOptions_ = parser_.parse(validOptions_, optsArr);
         } catch (ParseException e) {
             HelpFormatter formatter = new HelpFormatter();
-            formatter.printHelp( "[-loadKey] [-gt] [-gte] [-lt] [-lte] [-columnPrefix] [-caching] [-caster] [-limit]", validOptions_ );
+            formatter.printHelp( "[-loadKey] [-loadAsTimeStampVersionTuples] [-gt] [-gte] [-lt] [-lte] [-columnPrefix] [-caching] [-caster] [-limit] [-omitNulls] [-scanMaxVersions] [-scanStartTimestamp] [-scanEndTimestamp] [-rowKeyPrefixes] [-putTimestamp]", validOptions_ );
             throw e;
         }
 
@@ -223,6 +240,7 @@ public class HBaseStorage extends LoadFunc implements StoreFuncInterface, LoadPu
         for (String colName : colNames) {
             columnInfo_.add(new ColumnInfo(colName));
         }
+        loadAsTimeStampVersionTuples_  = configuredOptions_.hasOption("loadAsTimeStampVersionTuples");
 
         m_conf = HBaseConfiguration.create();
         String defaultCaster = m_conf.get(CASTER_PROPERTY, STRING_CASTER);
@@ -245,10 +263,16 @@ public class HBaseStorage extends LoadFunc implements StoreFuncInterface, LoadPu
 
         caching_ = Integer.valueOf(configuredOptions_.getOptionValue("caching", "100"));
         limit_ = Long.valueOf(configuredOptions_.getOptionValue("limit", "-1"));
+        rowKeyFilterPrefixes_ = configuredOptions_.getOptionValue("rowKeyPrefixes");
+        scanStartTimeStamp_ = Long.valueOf(configuredOptions_.getOptionValue("scanStartTimestamp", "-1"));
+        scanEndTimeStamp_ = Long.valueOf(configuredOptions_.getOptionValue("scanEndTimestamp", "-1"));
+        scanMaxVersions_ = Integer.valueOf(configuredOptions_.getOptionValue("scanMaxVersions", "1"));
+        omitNulls_ = configuredOptions_.hasOption("omitNulls");
+        putTimeStamp_ = Long.valueOf(configuredOptions_.getOptionValue("putTimestamp", Long.toString(System.currentTimeMillis())));
         initScan();	    
     }
 
-    private void initScan() {
+    private void initScan() throws IOException {
         scan = new Scan();
         // Set filters, if any.
         if (configuredOptions_.hasOption("gt")) {
@@ -266,6 +290,24 @@ public class HBaseStorage extends LoadFunc implements StoreFuncInterface, LoadPu
         if (configuredOptions_.hasOption("lte")) {
             lte_ = Bytes.toBytesBinary(Utils.slashisize(configuredOptions_.getOptionValue("lte")));
             addRowFilter(CompareOp.LESS_OR_EQUAL, lte_);
+        }
+        if (configuredOptions_.hasOption("rowKeyPrefixes")) {
+            FilterList filters = new FilterList(FilterList.Operator.MUST_PASS_ONE);
+            for( String rowKeyFilterPrefix : rowKeyFilterPrefixes_.split(ROWKEY_PREFIXES_DELIMITER) ) {
+                 filters.addFilter(new PrefixFilter(Bytes.toBytes(rowKeyFilterPrefix)));
+            }
+            scan.setFilter(filters);
+        }
+        if (configuredOptions_.hasOption("scanStartTimestamp") ) {
+            if (configuredOptions_.hasOption("scanEndTimestamp")) {
+                scan.setTimeRange(scanStartTimeStamp_, scanEndTimeStamp_);
+            } else {
+                scan.setTimeStamp(scanStartTimeStamp_);
+            }
+            scan.setMaxVersions();
+        }
+        if (configuredOptions_.hasOption("scanMaxVersions")) {
+            scan.setMaxVersions(scanMaxVersions_);
         }
 
         // apply any column filters
@@ -300,6 +342,15 @@ public class HBaseStorage extends LoadFunc implements StoreFuncInterface, LoadPu
         }
     }
 
+    private boolean isNullBytes(byte[] cell) {
+        for (byte b : cell) {
+            if (b != 0x00) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     private void addRowFilter(CompareOp op, byte[] val) {
         if (LOG.isInfoEnabled()) {
             LOG.info("Adding filter " + op.toString() +
@@ -320,6 +371,9 @@ public class HBaseStorage extends LoadFunc implements StoreFuncInterface, LoadPu
     @Override
     public Tuple getNext() throws IOException {
         try {
+            if (loadAsTimeStampVersionTuples_) {
+               return getNextRowVersion();
+            }
             if (!initialized) {
                 Properties p = UDFContext.getUDFContext().getUDFProperties(this.getClass(),
                         new String[] {contextSignature});
@@ -388,6 +442,9 @@ public class HBaseStorage extends LoadFunc implements StoreFuncInterface, LoadPu
                         // It's a column so set the value
                         byte[] cell=result.getValue(columnInfo.getColumnFamily(),
                                                     columnInfo.getColumnName());
+                        if (omitNulls_ && isNullBytes(cell)) {
+                            continue;
+                        }
                         DataByteArray value =
                                 cell == null ? null : new DataByteArray(cell);
                         tuple.set(currentIndex, value);
@@ -406,6 +463,83 @@ public class HBaseStorage extends LoadFunc implements StoreFuncInterface, LoadPu
             throw new IOException(e);
         }
         return null;
+    }
+
+    private Tuple getNextRowVersion() throws IOException {
+        try {
+            // if there are no row versions of the previous scanned result, get the next row !
+            while ((currentRowVersions == null || !currentRowVersions.hasNext())) {
+                if (!reader.nextKeyValue()) {
+                    return  null;
+                }
+                currentResult = (Result) reader.getCurrentValue();
+                flattenVersions(currentResult);
+            }
+
+            // Get a timestamp version row view
+            Map<String, byte[]> rowValues = (Map<String, byte[]>) currentRowVersions.next();
+            int tupleSize = columnInfo_.size();
+            if (loadRowKey_) {
+                tupleSize++;
+            }
+
+            Tuple tuple=TupleFactory.getInstance().newTuple(tupleSize);
+
+            int startIndex=0;
+            if (loadRowKey_) {
+                tuple.set(0, new DataByteArray(currentResult.getRow()));
+                startIndex++;
+            }
+            for (int i = 0;i < columnInfo_.size(); ++i){
+                int currentIndex = startIndex + i;
+                ColumnInfo columnInfo = columnInfo_.get(i);
+                byte[] cell = rowValues.get(getColumn(columnInfo));
+                if (omitNulls_ && isNullBytes(cell)) {
+                    continue;
+                }
+                DataByteArray value =
+                        cell == null ? null : new DataByteArray(cell);
+                tuple.set(currentIndex, value);
+            }
+            return tuple;
+        } catch (InterruptedException e) {
+            throw new IOException(e);
+        }
+    }
+
+    private String getColumn(ColumnInfo columnInfo) {
+        return new StringBuilder().append(Bytes.toString(columnInfo.getColumnFamily())).append(COLON).append(Bytes.toString(columnInfo.getColumnName())).toString();
+    }
+
+    // Construct an iterator for row versions based on timestamp from the three level map(Map<family,Map<qualifier,Map<timestamp,value>>>) return by the Mapper
+    private void flattenVersions(Result result) throws IOException {
+        Map<Long, Map<String, byte[]>>  bagOfTimeStampVersions = new TreeMap<Long, Map<String, byte[]>>();
+
+        //  Iterate over the the Column Families
+        for(Map.Entry entry: result.getMap().entrySet()) {
+            String columnFamily = Bytes.toString((byte[])entry.getKey());
+            NavigableMap<byte[],NavigableMap<Long,byte[]>> columnValueMap = (NavigableMap<byte[],NavigableMap<Long,byte[]>>)entry.getValue();
+            // Group the column value pair based on the timestamp
+            for(Map.Entry valueEntry: columnValueMap.entrySet()) {
+                String column  = Bytes.toString((byte[])valueEntry.getKey());
+                NavigableMap<Long,byte[]> columnVersions = (NavigableMap<Long,byte[]>)valueEntry.getValue();
+                for(Map.Entry<Long,byte[]> version: columnVersions.entrySet()) {
+                    long timeStamp = version.getKey();
+                    byte[] columnValue = version.getValue();
+                    if(bagOfTimeStampVersions.containsKey(timeStamp)) {
+                        bagOfTimeStampVersions.get(timeStamp).put(columnFamily+":"+column, columnValue);
+                        continue;
+                    }
+                    Map<String, byte[]> columnValues = new TreeMap<String, byte[]>();
+                    StringBuilder keybuilder = new StringBuilder().append(columnFamily).append(COLON).append(column);
+                    columnValues.put(keybuilder.toString(), columnValue);
+                    bagOfTimeStampVersions.put(timeStamp, columnValues);
+                }
+            }
+        }
+
+        // return the iterator for ease of use
+        currentRowVersions = bagOfTimeStampVersions.values().iterator();
     }
 
     @Override
@@ -555,8 +689,7 @@ public class HBaseStorage extends LoadFunc implements StoreFuncInterface, LoadPu
         }
         ResourceFieldSchema[] fieldSchemas = (schema_ == null) ? null : schema_.getFields();
         Put put=new Put(objToBytes(t.get(0), 
-                (fieldSchemas == null) ? DataType.findType(t.get(0)) : fieldSchemas[0].getType()));
-        long ts=System.currentTimeMillis();
+                (fieldSchemas == null) ? DataType.findType(t.get(0)) : fieldSchemas[0].getType()), putTimeStamp_);
         
         if (LOG.isDebugEnabled()) {
             for (ColumnInfo columnInfo : columnInfo_) {
@@ -566,17 +699,22 @@ public class HBaseStorage extends LoadFunc implements StoreFuncInterface, LoadPu
 
         for (int i=1;i<t.size();++i){
             ColumnInfo columnInfo = columnInfo_.get(i-1);
+            Object storeValue = t.get(i);
+
             if (LOG.isDebugEnabled()) {
-                LOG.debug("putNext - tuple: " + i + ", value=" + t.get(i) +
+                LOG.debug("putNext - tuple: " + i + ", value=" + storeValue +
                         ", cf:column=" + columnInfo);
         }
+            if (omitNulls_ && storeValue == null) {
+                continue;
+            }
 
             if (!columnInfo.isColumnMap()) {
                 put.add(columnInfo.getColumnFamily(), columnInfo.getColumnName(),
-                        ts, objToBytes(t.get(i), (fieldSchemas == null) ?
-                        DataType.findType(t.get(i)) : fieldSchemas[i].getType()));
+                        putTimeStamp_, objToBytes(storeValue, (fieldSchemas == null) ?
+                        DataType.findType(storeValue) : fieldSchemas[i].getType()));
             } else {
-                Map<String, Object> cfMap = (Map<String, Object>) t.get(i);
+                Map<String, Object> cfMap = (Map<String, Object>) storeValue;
                 for (String colName : cfMap.keySet()) {
                     if (LOG.isDebugEnabled()) {
                         LOG.debug("putNext - colName=" + colName +
@@ -584,7 +722,7 @@ public class HBaseStorage extends LoadFunc implements StoreFuncInterface, LoadPu
                     }
                     // TODO deal with the fact that maps can have types now. Currently we detect types at
                     // runtime in the case of storing to a cf, which is suboptimal.
-                    put.add(columnInfo.getColumnFamily(), Bytes.toBytes(colName.toString()), ts,
+                    put.add(columnInfo.getColumnFamily(), Bytes.toBytes(colName.toString()), putTimeStamp_,
                             objToBytes(cfMap.get(colName), DataType.findType(cfMap.get(colName))));
                 }
             }
